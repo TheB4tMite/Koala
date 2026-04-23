@@ -1,86 +1,136 @@
-# ZTA-MCP: Zero Trust Architecture for Model Context Protocol Servers
+# Project Koala: Zero Trust for MCP
 
-A security sidecar that places a Zero Trust boundary between AI agents and
-[Model Context Protocol](https://modelcontextprotocol.io) (MCP) servers. Instead of
-letting an agent talk directly to an MCP server, every JSON-RPC call is intercepted,
-authenticated, evaluated against policy, and sanitized before it reaches the tools.
+![Project Banner](https://img.shields.io/badge/Project-Koala-blueviolet?style=for-the-badge&logo=shield)
+![Security Architecture](https://img.shields.io/badge/Architecture-ZTA-success?style=for-the-badge)
+![Institution](https://img.shields.io/badge/Amrita_Vishwa_Vidyapeetham-Cybersecurity-blue?style=for-the-badge)
 
-## Motivation
+Project Koala is a Zero Trust Architecture (ZTA) implementation for Model Context Protocol (MCP) servers. Built as a 3rd-year B.Tech Cybersecurity course project at Amrita Vishwa Vidyapeetham, it applies rigorous **NIST SP 800-207** principles to AI Agents interacting with backend capabilities via MCP.
 
-MCP is rapidly becoming the standard interface for agent-to-tool communication, but
-the base protocol has no native notion of identity, dynamic trust, data loss
-prevention, or fine-grained authorization. This project wraps an MCP server in a
-Zero Trust architecture so that:
+---
 
-- No request is trusted by default — every call is re-evaluated.
-- Access is granted based on a *dynamic* trust score, not just a static role.
-- Egress data is scrubbed for sensitive material before it leaves the trust
-  boundary.
+## Project Overview
 
-## Architecture
+As AI agents increasingly consume enterprise resources via the Model Context Protocol (MCP), relying on perimeter-based security is no longer sufficient. Project Koala introduces a resilient, microservice-based Zero Trust Architecture that shifts security from network boundaries to individual transaction flows. 
 
+Every request is individually verified, cryptographically sealed, and dynamically authorized based on real-time continuous trust evaluations before being forwarded to the underlying MCP server.
+
+---
+
+## Architecture & Request Flow
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant PEP as PEP (Gateway)
+    participant PDP as PDP (Policy Engine)
+    participant MCP as MCP Core
+    
+    A->>PEP: MCP Request (e.g., tools/call)
+    PEP->>PEP: Compute payload hash
+    PEP->>PDP: POST /authorize (SecurityContext)
+    PDP->>PDP: Evaluate Trust Score
+    
+    alt Decision: PERMIT
+        PDP-->>PEP: PERMIT
+        PEP->>PEP: Sign SecurityContext (HMAC-SHA256)
+        PEP->>MCP: Forward Request + X-Koala-Context
+        MCP-->>PEP: Response
+        PEP->>PEP: Egress Scrubbing
+        PEP-->>A: MCP Response
+    else Decision: CHALLENGE
+        PDP-->>PEP: CHALLENGE
+        PEP->>PEP: Park Request (In-flight)
+        A->>PEP: POST /stepup/verify (Secondary Token)
+        PEP->>PEP: Release Parked Request
+        PEP->>MCP: Forward Request + X-Koala-Context
+        MCP-->>PEP: Response
+        PEP->>PEP: Egress Scrubbing
+        PEP-->>A: MCP Response
+    else Decision: DENY
+        PDP-->>PEP: DENY
+        PEP-->>A: 403 Forbidden / -32001
+    end
 ```
-+-----------+       +-------+       +-------+       +----------+
-| MockAgent | --->  |  PEP  | --->  |  PDP  |       | MCP Core |
-| (client)  |       | :8000 | <---  | :8181 |       |  :8080   |
-+-----------+       +---+---+       +-------+       +----+-----+
-                        |                                 ^
-                        +---------------------------------+
-                              forwarded JSON-RPC
-```
 
-| Component    | Role                                                                 |
-| ------------ | -------------------------------------------------------------------- |
-| **PEP**      | Policy Enforcement Point. FastAPI router. Intercepts JSON-RPC, applies identity + egress scrubbing, forwards to MCP Core. |
-| **PDP**      | Policy Decision Point. FastAPI + OPA. Computes dynamic trust scores and evaluates access rules. |
-| **MCP Core** | The actual MCP server built with the official Python `mcp` SDK (FastMCP). Hosts the tools. |
+---
 
-Only the **PEP** is exposed to the host. The PDP and MCP Core live on an
-internal Docker network and are unreachable from outside the trust boundary.
+## Core Components
 
-## Repository layout
+The architecture relies on the strict separation of control and data planes across three distinct Docker containers:
 
-```
-Koala/
-├── docker-compose.yml
-├── shared/            # cross-service code (schemas, utils)
-│   └── schemas/
-├── services/
-│   ├── pep/           # Policy Enforcement Point
-│   ├── pdp/           # Policy Decision Point
-│   └── mcp_core/      # MCP server with tools
-└── agents/
-    └── mock_agent.py  # test client
-```
+1. **PEP (Policy Enforcement Point - Routing Layer):** Acts as the gateway and interceptor for all incoming MCP traffic. It intercepts requests, builds the security context, enforces step-up auth handling by temporarily parking requests, and acts as the egress point for scrubbing outgoing data.
+2. **PDP (Policy Decision Point - Policy Engine):** Operates entirely out of band from the data plane. It evaluates requests against a continuous trust-scoring model, issuing real-time decisions (`PERMIT`, `CHALLENGE`, `DENY`), and securely logs the transaction using a tamper-evident hash-chain logger.
+3. **MCP Core:** The core server executing the actual capabilities. Operates in a strict "fail-closed" posture, only accepting traffic that contains a cryptographically verified `SecurityContext` envelope from the PEP.
 
-## Running
+---
 
-Requires Docker + Docker Compose.
+## Key Security Features
+
+Project Koala bridges academic theory and production-grade security, implementing:
+
+- **Cryptographic Context Sealing:** Every request payload is hashed and bound to a `SecurityContext` signed using HMAC-SHA256. This prevents request tampering and payload modification in transit.
+- **Continuous Trust Evaluation:** Implements CARTA (Continuous Adaptive Risk and Trust Assessment) rate-limiting, dynamically calculating trust scores per subject based on request frequencies and behaviors over time windows.
+- **Step-Up Authentication:** When trust scores drop into the `CHALLENGE` band, the PEP gracefully "parks" the in-flight request and waits for an out-of-band `stepup/verify` interaction. Once the secondary token is provided, the original request resumes.
+- **Tamper-Evident Audit Logging:** Ensures non-repudiation by pushing transaction records into a PostgreSQL database linked by a cryptographic hash-chain, guaranteeing that logs cannot be quietly modified or deleted.
+
+---
+
+## Quick Start / Setup
+
+### Prerequisites
+- Docker and Docker Compose
+- Python 3.9+ (For running the mock agent locally)
+
+### Environment Setup
+You can optionally define these environment variables, though sensible defaults are configured in `docker-compose.yml`:
 
 ```bash
+# Signing Secret used between PEP and MCP Core
+export KOALA_SIGNING_SECRET="koala_secret_dev"
+
+# Token expected for step-up challenge flows
+export KOALA_STEPUP_TOKEN="koala_admin_token"
+```
+
+### Running the Environment
+Clone the repository and spin up the microservices:
+
+```bash
+git clone https://github.com/your-org/Koala.git
+cd Koala
 docker-compose up --build
 ```
+This command builds and deploys the `pep` (port 8000), `pdp` (port 8181), and `mcp_core` (port 8080) services into an isolated bridge network (`zta_internal`).
 
-This brings up all three services. The PEP listens on `http://localhost:8000`.
+---
 
-In a second shell, fire a request through the PEP:
+## Testing the System
 
-```bash
-python agents/mock_agent.py
-```
+A `mock_agent.py` script is provided to demonstrate the Zero Trust features in action. It executes both a standard "Happy Path" and a simulated "Challenge Flow" that triggers rate-limiting.
 
-The mock agent will call `tools/list` and then invoke `get_weather`, both routed
-through the PEP.
+1. Ensure the Docker containers are running.
+2. Install HTTPX (used by the mock agent):
+   ```bash
+   pip install httpx
+   ```
+3. Run the mock agent:
+   ```bash
+   python agents/mock_agent.py
+   ```
 
-## Milestones
+**What to expect:**
+- The agent successfully initializes and calls `tools/list` and `tools/call`.
+- It intentionally spams the PEP to trigger a drop in its trust score.
+- The PDP responds with a `CHALLENGE` decision.
+- The PEP parks the request and the mock agent immediately sends a `/stepup/verify` request.
+- The parked request is securely released and fully executed.
 
-- **M1 — Pass-through (current):** end-to-end wiring. PEP forwards JSON-RPC to
-  MCP Core with no security checks. Two dummy tools exposed: `get_weather`,
-  `read_dummy_file`.
-- **M2 — Identity & AuthN:** OIDC/JWT at the PEP.
-- **M3 — PDP + OPA:** dynamic trust scoring, Rego policies.
-- **M4 — Egress DLP:** response scrubbing before it leaves the PEP.
+---
 
-## Status
+## The Team
 
-Milestone 1 scaffolding. Not production-ready. Academic project.
+- **Anirudh** (Lead / Architecture)
+- **Keerthan KK** (Developer)
+- **Aaron Mathews** (Developer)
+
+*Amrita Vishwa Vidyapeetham, 2026.*
