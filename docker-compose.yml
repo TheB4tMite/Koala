@@ -1,0 +1,40 @@
+services:
+  pep:
+    build:
+      context: .
+      dockerfile: services/pep/Dockerfile
+    container_name: zta-pep
+    environment:
+      MCP_CORE_URL: http://mcp_core:8080/mcp
+      PDP_URL: http://pdp:8181
+    ports:
+      - "8000:8000"
+    depends_on:
+      - pdp
+      - mcp_core
+    networks:
+      - zta_internal
+
+  pdp:
+    build:
+      context: .
+      dockerfile: services/pdp/Dockerfile
+    container_name: zta-pdp
+    expose:
+      - "8181"
+    networks:
+      - zta_internal
+
+  mcp_core:
+    build:
+      context: .
+      dockerfile: services/mcp_core/Dockerfile
+    container_name: zta-mcp-core
+    expose:
+      - "8080"
+    networks:
+      - zta_internal
+
+networks:
+  zta_internal:
+    driver: bridge
