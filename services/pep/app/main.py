@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -48,6 +49,23 @@ STEPUP_TIMEOUT_S = float(os.getenv("KOALA_STEPUP_TIMEOUT_S", "30"))
 UPSTREAM_TIMEOUT_S = float(os.getenv("MCP_UPSTREAM_TIMEOUT_S", "45"))
 CONTEXT_HEADER = "X-Koala-Context"
 SUBJECT_HEADER = "X-Koala-Subject"
+
+# Tool → resource-tier mapping for the Healthcare demo. Drives the PDP's
+# policy band selection (Restricted always requires step-up). Unknown tools
+# default to Public.
+TOOL_RESOURCE_TIER: dict[str, str] = {
+    "get_drug_interactions": "Public",
+    "get_patient_record": "Internal",
+    "prescribe_medication": "Restricted",
+}
+
+# Egress DLP: naive SSN redactor. Matches the US "XXX-XX-XXXX" format we use
+# in the mock patient dataset. Runs over the raw JSON bytes so both
+# ``structuredContent`` and the stringified ``content[0].text`` are scrubbed
+# in one pass. Production DLP would need format-preserving tokenization and
+# locale-aware context — this is demo-grade.
+_SSN_PATTERN = re.compile(rb"\b\d{3}-\d{2}-\d{4}\b")
+_SSN_REPLACEMENT = b"[REDACTED_SSN]"
 
 _HOP_BY_HOP = {
     "connection",
@@ -119,15 +137,25 @@ def _build_context(
         params = (rpc or {}).get("params") or {}
         if isinstance(params, dict):
             tool_name = params.get("name")
+    resource_tier = (
+        TOOL_RESOURCE_TIER.get(tool_name, "Public") if tool_name else "Public"
+    )
     return SecurityContext(
         request_id=str(uuid.uuid4()),
         timestamp=datetime.now(timezone.utc).isoformat(),
         method=method,
         tool_name=tool_name,
-        resource_tier="Public",
+        resource_tier=resource_tier,
         payload_hash=payload_hash,
         subject_id=subject_id,
     )
+
+
+def _scrub_egress(body: bytes) -> bytes:
+    """Run the SSN DLP pattern across raw response bytes."""
+    if not body:
+        return body
+    return _SSN_PATTERN.sub(_SSN_REPLACEMENT, body)
 
 
 def _encode_context_header(context: SecurityContext) -> str:
@@ -175,8 +203,13 @@ async def _forward(
         )
     latency_ms = (time.perf_counter() - start) * 1000
 
+    # Egress DLP: scrub sensitive data before it crosses the trust boundary.
+    # Content-Length is dropped by _filter_headers above (hop-by-hop) and
+    # Starlette re-emits it from the body we pass, so size changes are safe.
+    scrubbed = _scrub_egress(upstream.content)
+
     response = Response(
-        content=upstream.content,
+        content=scrubbed,
         status_code=upstream.status_code,
         headers=_filter_headers(dict(upstream.headers)),
         media_type=upstream.headers.get("content-type"),

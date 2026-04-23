@@ -84,7 +84,21 @@ def _resolve_subject(context: SecurityContext) -> str:
     return context.subject_id or context.agent_id or "anonymous"
 
 
-def _decide(score: float, count: int) -> tuple[Decision, str]:
+def _decide(score: float, count: int, tier: str | None) -> tuple[Decision, str]:
+    # Restricted-tier resources always require a step-up challenge, regardless
+    # of how well-behaved the subject has been. Only an outright rate-limit
+    # collapse (score below the CHALLENGE floor) escalates that to DENY.
+    if tier == "Restricted":
+        if score < CHALLENGE_THRESHOLD:
+            return (
+                "DENY",
+                f"restricted tier + rate exceeded: rate={count}/min trust={score:.2f}",
+            )
+        return (
+            "CHALLENGE",
+            f"restricted tier requires step-up (trust={score:.2f} rate={count}/min)",
+        )
+
     if score >= PERMIT_THRESHOLD:
         return "PERMIT", f"ok: trust={score:.2f} rate={count}/min"
     if score >= CHALLENGE_THRESHOLD:
@@ -100,7 +114,7 @@ async def authorize(context: SecurityContext) -> AuthorizeResponse:
     assert _audit is not None, "audit logger not initialized"
     subject = _resolve_subject(context)
     result = _scorer.record_and_score(subject)
-    decision, reason = _decide(result.score, result.count)
+    decision, reason = _decide(result.score, result.count, context.resource_tier)
 
     await _audit.append_log(
         {

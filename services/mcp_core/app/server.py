@@ -1,16 +1,16 @@
-"""MCP Core — Milestone 3.
+"""MCP Core — Healthcare Data Assistant demo build.
 
-Deny-by-default gate. Every request to a non-whitelisted path must carry a
-valid ``X-Koala-Context`` whose:
+Hosts three tools that simulate a clinical-decision assistant:
 
-  * HMAC signature verifies under the shared secret,
-  * ``timestamp`` is within ``[now - MAX_AGE_S, now + MAX_SKEW_S]`` — this
-    neutralizes replay attacks by bounding the window in which a captured
-    envelope is usable,
-  * ``payload_hash`` equals ``sha256(raw body)`` — preventing header reuse
-    against a different payload.
+    * get_drug_interactions  (Public)     — reference lookup, low risk.
+    * get_patient_record     (Internal)   — PHI read; returns a fake SSN
+                                            the PEP DLP layer will scrub.
+    * prescribe_medication   (Restricted) — privileged write; the PDP
+                                            forces a step-up challenge on
+                                            this resource tier.
 
-Only ``/health`` is exempt.
+The signature / timestamp / payload-hash middleware is *unchanged* from
+Milestone 3 — only the tools and the in-memory dataset are demo-specific.
 """
 
 from __future__ import annotations
@@ -39,15 +39,19 @@ CONTEXT_HEADER = "x-koala-context"
 MCP_PATH = "/mcp"
 WHITELISTED_PATHS: frozenset[str] = frozenset({"/health"})
 
-MAX_AGE_S = 60.0   # reject envelopes older than this
-MAX_SKEW_S = 5.0   # tolerate this much clock drift into the future
+MAX_AGE_S = 60.0
+MAX_SKEW_S = 5.0
 
 logger = logging.getLogger("mcp_core")
 logging.basicConfig(level=logging.INFO)
 
 mcp = FastMCP(
     name="zta-mcp-core",
-    instructions="Dummy MCP server for ZTA wrapper integration tests.",
+    instructions=(
+        "Healthcare Data Assistant mock MCP server. "
+        "Exposes drug-interaction lookup, patient record retrieval, "
+        "and a privileged prescribing endpoint."
+    ),
     host="0.0.0.0",
     port=8080,
     streamable_http_path=MCP_PATH,
@@ -55,24 +59,140 @@ mcp = FastMCP(
 )
 
 
+# ---- Mock clinical dataset ---------------------------------------------------
+
+_PATIENTS: dict[str, dict[str, Any]] = {
+    "P001": {
+        "patient_id": "P001",
+        "name": "Alice Walker",
+        "ssn": "123-45-6789",
+        "date_of_birth": "1984-06-12",
+        "medications": ["lisinopril 10mg"],
+        "allergies": ["penicillin"],
+    },
+    "P002": {
+        "patient_id": "P002",
+        "name": "Bob Martinez",
+        "ssn": "987-65-4321",
+        "date_of_birth": "1972-11-30",
+        "medications": ["metformin 500mg", "atorvastatin 20mg"],
+        "allergies": [],
+    },
+    "P003": {
+        "patient_id": "P003",
+        "name": "Clara Nguyen",
+        "ssn": "555-11-2233",
+        "date_of_birth": "1995-02-18",
+        "medications": [],
+        "allergies": ["sulfa"],
+    },
+}
+
+_INTERACTIONS: dict[tuple[str, str], dict[str, str]] = {
+    ("aspirin", "warfarin"): {
+        "severity": "MAJOR",
+        "effect": "Synergistic bleeding risk.",
+    },
+    ("ibuprofen", "warfarin"): {
+        "severity": "MAJOR",
+        "effect": "NSAID + anticoagulant increases GI bleed risk; avoid.",
+    },
+    ("amoxicillin", "warfarin"): {
+        "severity": "MODERATE",
+        "effect": "Potentiation of anticoagulant effect; monitor INR.",
+    },
+    ("lisinopril", "potassium"): {
+        "severity": "MODERATE",
+        "effect": "Additive hyperkalemia risk; monitor serum potassium.",
+    },
+}
+
+
+def _canonical_pair(drug_a: str, drug_b: str) -> tuple[str, str]:
+    a, b = drug_a.strip().lower(), drug_b.strip().lower()
+    return (a, b) if a <= b else (b, a)
+
+
+# ---- Tools -------------------------------------------------------------------
+
+
 @mcp.tool()
-def get_weather(location: str) -> dict[str, str | float]:
-    """Return a fake weather report for ``location``."""
+def get_drug_interactions(drug_a: str, drug_b: str) -> dict[str, Any]:
+    """Return a reference-library interaction summary for two drugs.
+
+    Public tier: no PHI, no writes.
+    """
+    key = _canonical_pair(drug_a, drug_b)
+    info = _INTERACTIONS.get(key)
+    if info is None:
+        return {
+            "drug_a": key[0],
+            "drug_b": key[1],
+            "severity": "NONE",
+            "effect": "No known major interaction in this formulary.",
+            "source": "Koala mock formulary v1.0",
+        }
     return {
-        "location": location,
-        "temperature_c": 21.5,
-        "conditions": "sunny",
-        "source": "mock",
+        "drug_a": key[0],
+        "drug_b": key[1],
+        "severity": info["severity"],
+        "effect": info["effect"],
+        "source": "Koala mock formulary v1.0",
     }
 
 
 @mcp.tool()
-def read_dummy_file() -> str:
-    """Return the contents of a hard-coded dummy file."""
-    return (
-        "Project Koala — dummy file.\n"
-        "This content is served by the MCP Core for integration tests.\n"
-    )
+def get_patient_record(patient_id: str) -> dict[str, Any]:
+    """Return the full patient record including demographics and PHI.
+
+    Internal tier: returns a synthetic SSN so the PEP's DLP layer has
+    something to scrub on the way out.
+    """
+    patient = _PATIENTS.get(patient_id.strip().upper())
+    if patient is None:
+        return {
+            "error": "not_found",
+            "message": f"No patient record for id={patient_id!r}",
+        }
+    # Return a shallow copy so downstream mutation doesn't leak into state.
+    return {
+        "patient_id": patient["patient_id"],
+        "name": patient["name"],
+        "ssn": patient["ssn"],
+        "date_of_birth": patient["date_of_birth"],
+        "medications": list(patient["medications"]),
+        "allergies": list(patient["allergies"]),
+    }
+
+
+@mcp.tool()
+def prescribe_medication(patient_id: str, medication: str) -> dict[str, Any]:
+    """Append a new prescription to a patient's record.
+
+    Restricted tier: the PDP forces a step-up challenge before the PEP
+    will forward this call to the Core.
+    """
+    pid = patient_id.strip().upper()
+    patient = _PATIENTS.get(pid)
+    if patient is None:
+        return {
+            "status": "error",
+            "message": f"No patient record for id={patient_id!r}",
+        }
+    med = medication.strip()
+    if not med:
+        return {"status": "error", "message": "medication must be non-empty"}
+    patient["medications"].append(med)
+    return {
+        "status": "prescribed",
+        "patient_id": pid,
+        "medication": med,
+        "active_medications": list(patient["medications"]),
+        "prescribed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---- Signature middleware (unchanged from M3) --------------------------------
 
 
 def _rpc_error(code: int, message: str, status: int = 401) -> JSONResponse:
@@ -158,8 +278,6 @@ class SignatureMiddleware(BaseHTTPMiddleware):
             )
             return _rpc_error(-32000, "invalid context signature")
 
-        # Replay window check — must come AFTER signature verification so an
-        # attacker can't craft fake timestamps to probe the clock.
         ts = _parse_ts(context.get("timestamp"))
         if ts is None:
             logger.warning("reject: unparseable timestamp")
@@ -196,8 +314,6 @@ class SignatureMiddleware(BaseHTTPMiddleware):
             )
             return _rpc_error(-32000, "payload hash mismatch")
 
-        # Re-inject body for the downstream MCP handler (reading request.body
-        # above consumed the ASGI receive stream).
         request._body = body  # type: ignore[attr-defined]
 
         logger.info(

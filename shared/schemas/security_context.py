@@ -29,7 +29,7 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict
 
-ResourceTier = Literal["Public", "Internal", "Confidential"]
+ResourceTier = Literal["Public", "Internal", "Confidential", "Restricted"]
 
 # Decision values MUST include all three. The scorer's CHALLENGE band depends
 # on this, and the PEP relies on strict equality against "PERMIT".
