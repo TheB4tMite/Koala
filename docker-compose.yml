@@ -1,4 +1,23 @@
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: zta-postgres
+    environment:
+      POSTGRES_USER: koala
+      POSTGRES_PASSWORD: koala_dev_pw
+      POSTGRES_DB: koala_audit
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U koala -d koala_audit"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    expose:
+      - "5432"
+    volumes:
+      - koala_audit_data:/var/lib/postgresql/data
+    networks:
+      - zta_internal
+
   pep:
     build:
       context: .
@@ -7,11 +26,18 @@ services:
     environment:
       MCP_CORE_URL: http://mcp_core:8080/mcp
       PDP_URL: http://pdp:8181
+      KOALA_SIGNING_SECRET: koala_secret_dev
+      KOALA_STEPUP_TOKEN: koala_admin_token
+      DATABASE_URL: postgresql://koala:koala_dev_pw@postgres:5432/koala_audit
     ports:
       - "8000:8000"
     depends_on:
-      - pdp
-      - mcp_core
+      postgres:
+        condition: service_healthy
+      pdp:
+        condition: service_started
+      mcp_core:
+        condition: service_started
     networks:
       - zta_internal
 
@@ -20,8 +46,13 @@ services:
       context: .
       dockerfile: services/pdp/Dockerfile
     container_name: zta-pdp
+    environment:
+      DATABASE_URL: postgresql://koala:koala_dev_pw@postgres:5432/koala_audit
     expose:
       - "8181"
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - zta_internal
 
@@ -30,6 +61,8 @@ services:
       context: .
       dockerfile: services/mcp_core/Dockerfile
     container_name: zta-mcp-core
+    environment:
+      KOALA_SIGNING_SECRET: koala_secret_dev
     expose:
       - "8080"
     networks:
@@ -38,3 +71,6 @@ services:
 networks:
   zta_internal:
     driver: bridge
+
+volumes:
+  koala_audit_data:

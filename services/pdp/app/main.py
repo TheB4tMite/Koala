@@ -1,9 +1,9 @@
-"""PDP (Policy Decision Point) — Milestone 4.
+"""PDP (Policy Decision Point) — Milestone 5.
 
 Evaluates a ``SecurityContext`` against a dynamic trust score and returns a
-decision (``PERMIT`` / ``CHALLENGE`` / ``DENY``). A background task sweeps
-expired entries out of the scorer's in-memory store every 60 seconds so that
-idle subjects don't leak memory.
+decision. On every decision the PDP appends a tamper-evident audit event to
+the shared hash-chain log. A background task sweeps expired entries from the
+in-memory trust-scorer store every 60 seconds.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict
 
 from app.trust.scorer import DEFAULT_SCORER, TrustScorer
+from shared.audit.logger import AuditLogger, logger_from_env
 from shared.schemas.security_context import Decision, SecurityContext
 
 PERMIT_THRESHOLD = 0.8
@@ -26,10 +27,10 @@ logger = logging.getLogger("pdp")
 logging.basicConfig(level=logging.INFO)
 
 _scorer: TrustScorer = DEFAULT_SCORER
+_audit: AuditLogger | None = None
 
 
 async def _gc_loop() -> None:
-    """Drain expired entries from the trust-score store on a fixed cadence."""
     while True:
         try:
             await asyncio.sleep(GC_INTERVAL_S)
@@ -40,25 +41,30 @@ async def _gc_loop() -> None:
             logger.info("trust-scorer gc: stopping")
             raise
         except Exception:
-            # A crashing GC must not kill the PDP. Log and keep looping.
             logger.exception("trust-scorer gc: iteration failed")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    task = asyncio.create_task(_gc_loop(), name="trust-scorer-gc")
+    global _audit
+    _audit = logger_from_env(service="pdp")
+    await _audit.connect()
+    await _audit.init_schema()
+
+    gc_task = asyncio.create_task(_gc_loop(), name="trust-scorer-gc")
     logger.info("PDP up; gc interval=%.0fs", GC_INTERVAL_S)
     try:
         yield
     finally:
-        task.cancel()
+        gc_task.cancel()
         try:
-            await task
+            await gc_task
         except asyncio.CancelledError:
             pass
+        await _audit.close()
 
 
-app = FastAPI(title="ZTA-MCP PDP", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="ZTA-MCP PDP", version="0.6.0", lifespan=lifespan)
 
 
 class AuthorizeResponse(BaseModel):
@@ -91,9 +97,28 @@ def _decide(score: float, count: int) -> tuple[Decision, str]:
 
 @app.post("/authorize", response_model=AuthorizeResponse)
 async def authorize(context: SecurityContext) -> AuthorizeResponse:
+    assert _audit is not None, "audit logger not initialized"
     subject = _resolve_subject(context)
     result = _scorer.record_and_score(subject)
     decision, reason = _decide(result.score, result.count)
+
+    await _audit.append_log(
+        {
+            "subject_id": subject,
+            "action": "AUTHORIZE",
+            "decision": decision,
+            "resource_tier": context.resource_tier,
+            "details": {
+                "request_id": context.request_id,
+                "method": context.method,
+                "tool_name": context.tool_name,
+                "trust_score": result.score,
+                "rate_in_window": result.count,
+                "reason": reason,
+            },
+        }
+    )
+
     return AuthorizeResponse(
         decision=decision,
         trust_score=result.score,

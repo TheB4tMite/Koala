@@ -56,11 +56,12 @@ sequenceDiagram
 
 ## Core Components
 
-The architecture relies on the strict separation of control and data planes across three distinct Docker containers:
+The architecture relies on the strict separation of control and data planes across four Docker containers:
 
 1. **PEP (Policy Enforcement Point - Routing Layer):** Acts as the gateway and interceptor for all incoming MCP traffic. It intercepts requests, builds the security context, enforces step-up auth handling by temporarily parking requests, and acts as the egress point for scrubbing outgoing data.
 2. **PDP (Policy Decision Point - Policy Engine):** Operates entirely out of band from the data plane. It evaluates requests against a continuous trust-scoring model, issuing real-time decisions (`PERMIT`, `CHALLENGE`, `DENY`), and securely logs the transaction using a tamper-evident hash-chain logger.
 3. **MCP Core:** The core server executing the actual capabilities. Operates in a strict "fail-closed" posture, only accepting traffic that contains a cryptographically verified `SecurityContext` envelope from the PEP.
+4. **PostgreSQL (Audit Store):** A dedicated datastore backing the tamper-evident hash-chain log. Both PEP and PDP write audit events here under a shared advisory lock so the chain remains strictly linear across services. Reachable only from the internal Docker network.
 
 ---
 
@@ -79,7 +80,7 @@ Project Koala bridges academic theory and production-grade security, implementin
 
 ### Prerequisites
 - Docker and Docker Compose
-- Python 3.9+ (For running the mock agent locally)
+- Python 3.10+ (for running the mock agent and test harness locally)
 
 ### Environment Setup
 You can optionally define these environment variables, though sensible defaults are configured in `docker-compose.yml`:
@@ -90,6 +91,9 @@ export KOALA_SIGNING_SECRET="koala_secret_dev"
 
 # Token expected for step-up challenge flows
 export KOALA_STEPUP_TOKEN="koala_admin_token"
+
+# Postgres DSN for the tamper-evident audit log
+export DATABASE_URL="postgresql://koala:koala_dev_pw@postgres:5432/koala_audit"
 ```
 
 ### Running the Environment
@@ -100,7 +104,8 @@ git clone https://github.com/your-org/Koala.git
 cd Koala
 docker-compose up --build
 ```
-This command builds and deploys the `pep` (port 8000), `pdp` (port 8181), and `mcp_core` (port 8080) services into an isolated bridge network (`zta_internal`).
+
+This builds and deploys four services — `pep`, `pdp`, `mcp_core`, and `postgres` — onto an isolated bridge network (`zta_internal`). Following Zero Trust, **only the PEP is exposed to the host** (`http://localhost:8000`); `pdp`, `mcp_core`, and `postgres` are reachable only from inside the internal network. All inter-service traffic is identity-bound, signed, and audited.
 
 ---
 
@@ -109,7 +114,7 @@ This command builds and deploys the `pep` (port 8000), `pdp` (port 8181), and `m
 A `mock_agent.py` script is provided to demonstrate the Zero Trust features in action. It executes both a standard "Happy Path" and a simulated "Challenge Flow" that triggers rate-limiting.
 
 1. Ensure the Docker containers are running.
-2. Install HTTPX (used by the mock agent):
+2. Install HTTPX (used by the mock agent and the test harness):
    ```bash
    pip install httpx
    ```
@@ -124,6 +129,17 @@ A `mock_agent.py` script is provided to demonstrate the Zero Trust features in a
 - The PDP responds with a `CHALLENGE` decision.
 - The PEP parks the request and the mock agent immediately sends a `/stepup/verify` request.
 - The parked request is securely released and fully executed.
+
+### Full stress & attack suite
+
+For a deeper, section-by-section walkthrough — rate-limit band stress, step-up brute-force probing, direct-to-core replay / payload-tamper / signature-bypass attacks, and end-to-end hash-chain verification — see [`test/TEST.md`](test/TEST.md). The harness includes:
+
+| Script | Purpose |
+| --- | --- |
+| `test/stress_rate_limit.py`  | Drives one subject through `PERMIT → CHALLENGE → DENY`. |
+| `test/stepup_probe.py`       | Exercises audited 401 / 404 branches of `/stepup/verify`. |
+| `test/forge_attack.py`       | Runs inside the PEP container; hits MCP Core directly with forged / stale / tampered envelopes. |
+| `test/verify_chain.py`       | Recomputes every `record_hash` from Postgres and flags any broken link. |
 
 ---
 

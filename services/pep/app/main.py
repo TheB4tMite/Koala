@@ -1,22 +1,20 @@
-"""PEP (Policy Enforcement Point) — Milestone 4.
+"""PEP (Policy Enforcement Point) — Milestone 5.
 
-Pipeline per incoming request:
+Adds tamper-evident audit logging: after a successful tool execution
+returned by the MCP Core, the PEP appends a ``TOOL_CALL`` event (with
+response latency) to the shared hash-chain log. Step-up timeouts and policy
+denials are also logged as ``DENY`` / ``STEPUP`` events for completeness.
 
-    1. Compute ``payload_hash = sha256(body)`` and build a
-       :class:`SecurityContext`.
-    2. POST the context to the PDP ``/authorize`` endpoint.
-    3. On ``PERMIT``        — sign and forward immediately.
-       On ``CHALLENGE``     — *park* the request on an ``asyncio.Event``
-                              keyed by ``subject_id``. A second request to
-                              ``POST /stepup/verify`` releases the event,
-                              at which point the PEP signs the original
-                              envelope and forwards it. A 30-second timeout
-                              returns a JSON-RPC ``-32000``.
-       On ``DENY``          — reject with JSON-RPC ``-32001``.
+Pipeline:
 
-The signing key lives only on the PEP. The PDP is a pure decision engine.
-Identity wiring (full OIDC) is still future work; until then the PEP reads
-``X-Koala-Subject`` off the client request to seed ``subject_id``.
+    1. Build ``SecurityContext`` (request_id, timestamp, method, tool_name,
+       payload_hash = sha256(body), subject_id from X-Koala-Subject).
+    2. POST the context to the PDP ``/authorize``.
+    3. On ``PERMIT``     — sign and forward.
+       On ``CHALLENGE``  — park on an asyncio.Event keyed by subject_id;
+                           ``/stepup/verify`` releases it.
+       On ``DENY``       — JSON-RPC -32001.
+    4. Log the final outcome (and latency) to the audit chain.
 """
 
 from __future__ import annotations
@@ -27,7 +25,9 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +36,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from shared.audit.logger import AuditLogger, logger_from_env
 from shared.crypto.hmac_sign import sign_context
 from shared.schemas.security_context import SecurityContext
 
@@ -61,29 +62,33 @@ _HOP_BY_HOP = {
     "content-length",
 }
 
-# Parked challenges waiting for step-up. Key: subject_id. Value: the event
-# the request handler is awaiting. Access is single-threaded under the
-# uvicorn event loop, so no explicit lock is needed.
 PARKED_REQUESTS: dict[str, asyncio.Event] = {}
 
 logger = logging.getLogger("pep")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="ZTA-MCP PEP", version="0.5.0")
 _client: httpx.AsyncClient | None = None
+_audit: AuditLogger | None = None
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    global _client
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _client, _audit
     _client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_S)
+    _audit = logger_from_env(service="pep")
+    await _audit.connect()
+    # PDP also runs init_schema on startup; calling it here is idempotent
+    # and means the PEP can write even if the PDP is slower to come up.
+    await _audit.init_schema()
     logger.info("PEP up; forwarding to %s via PDP %s", MCP_CORE_URL, PDP_URL)
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    if _client is not None:
+    try:
+        yield
+    finally:
         await _client.aclose()
+        await _audit.close()
+
+
+app = FastAPI(title="ZTA-MCP PEP", version="0.6.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -143,14 +148,15 @@ def _rpc_error(status: int, id_: Any, code: int, message: str) -> JSONResponse:
 
 async def _forward(
     request: Request, body: bytes, context: SecurityContext, rpc_id: Any
-) -> Response:
-    """Sign the context and proxy the original request to the MCP Core."""
+) -> tuple[Response, float, int]:
+    """Sign, forward, and return the upstream response + latency_ms + status."""
     assert _client is not None
     context.signature = sign_context(context.to_signable(), SIGNING_SECRET)
 
     headers = _filter_headers(dict(request.headers))
     headers[CONTEXT_HEADER] = _encode_context_header(context)
 
+    start = time.perf_counter()
     try:
         upstream = await _client.request(
             method=request.method,
@@ -160,26 +166,26 @@ async def _forward(
             params=request.query_params,
         )
     except httpx.RequestError as exc:
+        latency_ms = (time.perf_counter() - start) * 1000
         logger.exception("upstream failure")
-        return _rpc_error(502, rpc_id, -32000, f"upstream unreachable: {exc!s}")
+        return (
+            _rpc_error(502, rpc_id, -32000, f"upstream unreachable: {exc!s}"),
+            latency_ms,
+            0,
+        )
+    latency_ms = (time.perf_counter() - start) * 1000
 
-    return Response(
+    response = Response(
         content=upstream.content,
         status_code=upstream.status_code,
         headers=_filter_headers(dict(upstream.headers)),
         media_type=upstream.headers.get("content-type"),
     )
+    return response, latency_ms, upstream.status_code
 
 
 async def _park_for_stepup(subject_id: str, request_id: str) -> bool:
-    """Block this request until a matching ``/stepup/verify`` arrives.
-
-    Returns ``True`` if the step-up succeeded, ``False`` on timeout.
-    """
     event = asyncio.Event()
-    # Overwriting an existing parked event is intentional: only the most
-    # recent challenge for a given subject holds the slot. Earlier parked
-    # coroutines will time out on their own.
     PARKED_REQUESTS[subject_id] = event
     logger.info(
         "parking request_id=%s subject=%s for step-up", request_id, subject_id
@@ -190,10 +196,65 @@ async def _park_for_stepup(subject_id: str, request_id: str) -> bool:
     except asyncio.TimeoutError:
         return False
     finally:
-        # Clear our slot iff it's still ours (the stepup handler also pops
-        # on success, and a newer challenge may have replaced us).
         if PARKED_REQUESTS.get(subject_id) is event:
             PARKED_REQUESTS.pop(subject_id, None)
+
+
+async def _audit_tool_call(
+    *,
+    subject_id: str,
+    context: SecurityContext,
+    upstream_status: int,
+    latency_ms: float,
+    stepped_up: bool,
+) -> None:
+    assert _audit is not None
+    try:
+        await _audit.append_log(
+            {
+                "subject_id": subject_id,
+                "action": "TOOL_CALL",
+                "decision": "PERMIT",
+                "resource_tier": context.resource_tier,
+                "details": {
+                    "request_id": context.request_id,
+                    "method": context.method,
+                    "tool_name": context.tool_name,
+                    "upstream_status": upstream_status,
+                    "latency_ms": round(latency_ms, 2),
+                    "stepped_up": stepped_up,
+                    "trust_score": context.trust_score,
+                },
+            }
+        )
+    except Exception:
+        # Audit failure must not poison the user response; it is logged loudly
+        # so operators can investigate. In a regulated deployment the service
+        # should fail-closed here, but M5 keeps the request path available.
+        logger.exception("audit append failed for request_id=%s", context.request_id)
+
+
+async def _audit_denial(
+    *, subject_id: str, context: SecurityContext, reason: str, action: str
+) -> None:
+    assert _audit is not None
+    try:
+        await _audit.append_log(
+            {
+                "subject_id": subject_id,
+                "action": action,
+                "decision": "DENY",
+                "resource_tier": context.resource_tier,
+                "details": {
+                    "request_id": context.request_id,
+                    "method": context.method,
+                    "tool_name": context.tool_name,
+                    "reason": reason,
+                },
+            }
+        )
+    except Exception:
+        logger.exception("audit append failed for request_id=%s", context.request_id)
 
 
 @app.post("/mcp")
@@ -226,15 +287,19 @@ async def mcp_proxy(request: Request) -> Response:
     context.trust_score = decision_body.get("trust_score")
 
     if decision == "DENY":
+        reason = decision_body.get("reason") or "denied"
         logger.info(
-            "PDP denied request_id=%s reason=%s",
-            context.request_id,
-            decision_body.get("reason"),
+            "PDP denied request_id=%s reason=%s", context.request_id, reason
         )
-        return _rpc_error(
-            403, rpc_id, -32001, f"denied by policy: {decision_body.get('reason')}"
+        await _audit_denial(
+            subject_id=subject_id,
+            context=context,
+            reason=reason,
+            action="DENY",
         )
+        return _rpc_error(403, rpc_id, -32001, f"denied by policy: {reason}")
 
+    stepped_up = False
     if decision == "CHALLENGE":
         released = await _park_for_stepup(subject_id, context.request_id)
         if not released:
@@ -242,6 +307,12 @@ async def mcp_proxy(request: Request) -> Response:
                 "step-up timeout request_id=%s subject=%s",
                 context.request_id,
                 subject_id,
+            )
+            await _audit_denial(
+                subject_id=subject_id,
+                context=context,
+                reason="step-up timeout",
+                action="STEPUP",
             )
             return _rpc_error(
                 408, rpc_id, -32000, "Step-up authentication timed out"
@@ -251,14 +322,36 @@ async def mcp_proxy(request: Request) -> Response:
             context.request_id,
             subject_id,
         )
-        context.decision = "PERMIT"
-        return await _forward(request, body, context, rpc_id)
+        stepped_up = True
 
-    if decision != "PERMIT":
+    if decision not in ("PERMIT", "CHALLENGE"):
         return _rpc_error(502, rpc_id, -32000, f"unexpected PDP decision: {decision}")
 
     context.decision = "PERMIT"
-    return await _forward(request, body, context, rpc_id)
+    response, latency_ms, upstream_status = await _forward(
+        request, body, context, rpc_id
+    )
+
+    # Audit only *successful* tool execution in the successful-path bucket;
+    # upstream 2xx / 3xx counts as success from the PEP's perspective. A 4xx
+    # or 5xx from the core is logged as a denial-ish event instead.
+    if 200 <= upstream_status < 400:
+        await _audit_tool_call(
+            subject_id=subject_id,
+            context=context,
+            upstream_status=upstream_status,
+            latency_ms=latency_ms,
+            stepped_up=stepped_up,
+        )
+    else:
+        await _audit_denial(
+            subject_id=subject_id,
+            context=context,
+            reason=f"upstream status {upstream_status}",
+            action="TOOL_CALL",
+        )
+
+    return response
 
 
 # ---- Step-up endpoint --------------------------------------------------------
@@ -271,21 +364,70 @@ class StepupRequest(BaseModel):
     secondary_token: str
 
 
+async def _audit_stepup(
+    *,
+    subject_id: str,
+    decision: str,
+    reason: str,
+    http_status: int,
+) -> None:
+    """Record a step-up outcome on the tamper-evident audit chain.
+
+    Every branch of :func:`stepup_verify` must funnel through here so that
+    probing attacks (bad tokens, no-parked-challenge reconnaissance) are
+    immutably recorded alongside legitimate successes.
+    """
+    assert _audit is not None
+    try:
+        await _audit.append_log(
+            {
+                "subject_id": subject_id,
+                "action": "STEPUP",
+                "decision": decision,
+                "resource_tier": None,
+                "details": {
+                    "reason": reason,
+                    "http_status": http_status,
+                },
+            }
+        )
+    except Exception:
+        logger.exception("audit append failed for stepup subject=%s", subject_id)
+
+
 @app.post("/stepup/verify")
 async def stepup_verify(payload: StepupRequest) -> dict[str, str]:
-    # M4 uses a static admin token. M5+ replaces this with a TOTP / WebAuthn
-    # round-trip against an identity provider.
     if payload.secondary_token != STEPUP_TOKEN:
-        logger.warning(
-            "stepup: bad token for subject=%s", payload.subject_id
+        logger.warning("stepup: bad token for subject=%s", payload.subject_id)
+        await _audit_stepup(
+            subject_id=payload.subject_id,
+            decision="DENY",
+            reason="Invalid token",
+            http_status=401,
         )
         raise HTTPException(status_code=401, detail="invalid secondary token")
 
     event = PARKED_REQUESTS.pop(payload.subject_id, None)
     if event is None:
+        logger.warning(
+            "stepup: no parked challenge for subject=%s", payload.subject_id
+        )
+        await _audit_stepup(
+            subject_id=payload.subject_id,
+            decision="DENY",
+            reason="No active challenge",
+            http_status=404,
+        )
         raise HTTPException(
             status_code=404, detail="no pending challenge for subject"
         )
+
     event.set()
     logger.info("stepup: released subject=%s", payload.subject_id)
+    await _audit_stepup(
+        subject_id=payload.subject_id,
+        decision="PERMIT",
+        reason="Step-up verified",
+        http_status=200,
+    )
     return {"status": "success"}
