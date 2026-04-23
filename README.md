@@ -1,152 +1,133 @@
-# Project Koala: Zero Trust for MCP
+# Project Koala: Zero Trust for Healthcare MCP Agents 🐨🔒
 
-![Project Banner](https://img.shields.io/badge/Project-Koala-blueviolet?style=for-the-badge&logo=shield)
-![Security Architecture](https://img.shields.io/badge/Architecture-ZTA-success?style=for-the-badge)
-![Institution](https://img.shields.io/badge/Amrita_Vishwa_Vidyapeetham-Cybersecurity-blue?style=for-the-badge)
-
-Project Koala is a Zero Trust Architecture (ZTA) implementation for Model Context Protocol (MCP) servers. Built as a 3rd-year B.Tech Cybersecurity course project at Amrita Vishwa Vidyapeetham, it applies rigorous **NIST SP 800-207** principles to AI Agents interacting with backend capabilities via MCP.
-
----
+![Status](https://img.shields.io/badge/Status-IEEE_Demo_Ready-success)
+![Course](https://img.shields.io/badge/Course-B.Tech_Cybersecurity-blue)
+![University](https://img.shields.io/badge/University-Amrita_Vishwa_Vidyapeetham-red)
 
 ## Project Overview
 
-As AI agents increasingly consume enterprise resources via the Model Context Protocol (MCP), relying on perimeter-based security is no longer sufficient. Project Koala introduces a resilient, microservice-based Zero Trust Architecture that shifts security from network boundaries to individual transaction flows. 
+As autonomous AI agents increasingly interface with sensitive infrastructure via the Model Context Protocol (MCP), perimeter-based security is no longer sufficient. **Project Koala** provides a mathematically rigorous **Zero Trust Architecture (ZTA)** wrapper for MCP servers, rigidly adhering to the **NIST SP 800-207** framework.
 
-Every request is individually verified, cryptographically sealed, and dynamically authorized based on real-time continuous trust evaluations before being forwarded to the underlying MCP server.
+Designed for high-stakes healthcare environments, this implementation prevents compromised AI agents from exfiltrating Protected Health Information (PHI) or executing unauthorized clinical commands. It achieves this by decoupling policy enforcement from business logic, explicitly refusing network trust, and strictly verifying cryptographic provenance for every single remote procedure call.
 
 ---
 
-## Architecture & Request Flow
+## Architectural Flow
+
+Project Koala introduces a Policy Enforcement Point (PEP) and a Policy Decision Point (PDP) that intercept and evaluate all MCP traffic before it ever reaches the MCP Core.
 
 ```mermaid
 sequenceDiagram
-    participant A as Agent
-    participant PEP as PEP (Gateway)
-    participant PDP as PDP (Policy Engine)
-    participant MCP as MCP Core
-    
-    A->>PEP: MCP Request (e.g., tools/call)
-    PEP->>PEP: Compute payload hash
+    participant Agent as AI Agent (Client)
+    participant PEP as Policy Enforcement Point
+    participant PDP as Policy Decision Point
+    participant DB as Postgres (Audit Hash-Chain)
+    participant Core as MCP Core (Resource Server)
+
+    Agent->>PEP: POST /mcp (JSON-RPC)
+    activate PEP
+    PEP->>PEP: Hash request payload
     PEP->>PDP: POST /authorize (SecurityContext)
-    PDP->>PDP: Evaluate Trust Score
+    activate PDP
+    PDP->>PDP: Evaluate Continuous Trust Score
+    PDP->>DB: Log AUTHORIZE event (Tamper-Evident)
     
-    alt Decision: PERMIT
-        PDP-->>PEP: PERMIT
-        PEP->>PEP: Sign SecurityContext (HMAC-SHA256)
-        PEP->>MCP: Forward Request + X-Koala-Context
-        MCP-->>PEP: Response
-        PEP->>PEP: Egress Scrubbing
-        PEP-->>A: MCP Response
-    else Decision: CHALLENGE
-        PDP-->>PEP: CHALLENGE
-        PEP->>PEP: Park Request (In-flight)
-        A->>PEP: POST /stepup/verify (Secondary Token)
-        PEP->>PEP: Release Parked Request
-        PEP->>MCP: Forward Request + X-Koala-Context
-        MCP-->>PEP: Response
-        PEP->>PEP: Egress Scrubbing
-        PEP-->>A: MCP Response
-    else Decision: DENY
+    alt Decision: DENY
         PDP-->>PEP: DENY
-        PEP-->>A: 403 Forbidden / -32001
+        PEP-->>Agent: 403 Forbidden (JSON-RPC Error)
+    else Decision: CHALLENGE (Restricted Action)
+        PDP-->>PEP: CHALLENGE
+        PEP->>PEP: Park request (Async Event)
+        Agent->>PEP: POST /stepup/verify (Secondary Token)
+        PEP->>DB: Log STEPUP event
+        PEP->>PEP: Unpark request
     end
+
+    PDP-->>PEP: PERMIT
+    deactivate PDP
+
+    PEP->>PEP: Sign Context (HMAC-SHA256)
+    PEP->>Core: Forward request + X-Koala-Context
+    activate Core
+    Core->>Core: Verify Signature, Payload Hash & Temporal Freshness
+    Core->>Core: Execute Tool
+    Core-->>PEP: Return Raw Result
+    deactivate Core
+
+    PEP->>PEP: Egress DLP (Scrub SSN/PHI)
+    PEP->>DB: Log TOOL_CALL event
+    PEP-->>Agent: Safe JSON-RPC Response
+    deactivate PEP
 ```
 
 ---
 
-## Core Components
+## The Healthcare Demo Scenario
 
-The architecture relies on the strict separation of control and data planes across four Docker containers:
+To demonstrate the architecture, the MCP Core exposes a mock clinical-decision assistant with three distinct tools mapped to progressive resource tiers:
 
-1. **PEP (Policy Enforcement Point - Routing Layer):** Acts as the gateway and interceptor for all incoming MCP traffic. It intercepts requests, builds the security context, enforces step-up auth handling by temporarily parking requests, and acts as the egress point for scrubbing outgoing data.
-2. **PDP (Policy Decision Point - Policy Engine):** Operates entirely out of band from the data plane. It evaluates requests against a continuous trust-scoring model, issuing real-time decisions (`PERMIT`, `CHALLENGE`, `DENY`), and securely logs the transaction using a tamper-evident hash-chain logger.
-3. **MCP Core:** The core server executing the actual capabilities. Operates in a strict "fail-closed" posture, only accepting traffic that contains a cryptographically verified `SecurityContext` envelope from the PEP.
-4. **PostgreSQL (Audit Store):** A dedicated datastore backing the tamper-evident hash-chain log. Both PEP and PDP write audit events here under a shared advisory lock so the chain remains strictly linear across services. Reachable only from the internal Docker network.
+1. `get_drug_interactions` **(Public Tier)**
+   * **Action:** Queries a mock formulary for drug interactions.
+   * **Security:** Allowed by default, assuming the agent's continuous trust score has not dipped due to rate-limit violations.
+2. `get_patient_record` **(Internal Tier)**
+   * **Action:** Retrieves patient demographics and medical history.
+   * **Security:** Contains highly sensitive PHI (SSNs). On the return path, the PEP's **Egress Data Loss Prevention (DLP)** engine automatically detects and replaces the SSN with `[REDACTED_SSN]` to prevent the agent from absorbing or leaking the data.
+3. `prescribe_medication` **(Restricted Tier)**
+   * **Action:** A state-modifying write action to a patient's chart.
+   * **Security:** Triggers an immediate **Step-Up Authentication** challenge. The PEP parks the in-flight request and forces the agent to supply a secondary verification token before the cryptographic seal is generated.
 
 ---
 
-## Key Security Features
+## Core Zero Trust Features
 
-Project Koala bridges academic theory and production-grade security, implementing:
-
-- **Cryptographic Context Sealing:** Every request payload is hashed and bound to a `SecurityContext` signed using HMAC-SHA256. This prevents request tampering and payload modification in transit.
-- **Continuous Trust Evaluation:** Implements CARTA (Continuous Adaptive Risk and Trust Assessment) rate-limiting, dynamically calculating trust scores per subject based on request frequencies and behaviors over time windows.
-- **Step-Up Authentication:** When trust scores drop into the `CHALLENGE` band, the PEP gracefully "parks" the in-flight request and waits for an out-of-band `stepup/verify` interaction. Once the secondary token is provided, the original request resumes.
-- **Tamper-Evident Audit Logging:** Ensures non-repudiation by pushing transaction records into a PostgreSQL database linked by a cryptographic hash-chain, guaranteeing that logs cannot be quietly modified or deleted.
+*   **Cryptographic Context Sealing:** The PEP locks the request metadata and a SHA-256 hash of the payload inside an HMAC-SHA256 envelope. The MCP Core strictly fails closed, completely rejecting traffic lacking a valid signature, mismatched payload hash, or stale timestamp (defending against Replay Attacks and network bypass).
+*   **Continuous Trust Evaluation (CARTA):** The PDP features a sliding-window rate-limiter that acts as a continuous trust scorer. A subject's trust score dynamically drops upon anomalous request volumes, downgrading their access from `PERMIT` to `CHALLENGE` or `DENY`.
+*   **Asynchronous Step-Up Authentication:** When the PDP returns `CHALLENGE`, the PEP safely suspends the asyncio coroutine without dropping the connection or leaking memory. The request only resumes when an out-of-band `/stepup/verify` call provides a valid token.
+*   **Tamper-Evident Audit Logging:** Every terminal security decision is recorded in PostgreSQL. Each row is bound to the previous row via `record_hash = sha256(prev_hash || payload)`. Postgres advisory locks serialize concurrent writes across instances, ensuring the chain is mathematically unbroken and immune to silent database tampering.
+*   **Egress Data Loss Prevention (DLP):** Outbound payload scrubbing prevents the MCP Core from accidentally leaking protected data to the untrusted agent network.
 
 ---
 
 ## Quick Start / Setup
 
-### Prerequisites
-- Docker and Docker Compose
-- Python 3.10+ (for running the mock agent and test harness locally)
+Project Koala is completely containerized. The `docker-compose.yml` orchestrates the PostgreSQL database, the PDP, the PEP, and the MCP Core on an isolated internal network.
 
-### Environment Setup
-You can optionally define these environment variables, though sensible defaults are configured in `docker-compose.yml`:
-
-```bash
-# Signing Secret used between PEP and MCP Core
-export KOALA_SIGNING_SECRET="koala_secret_dev"
-
-# Token expected for step-up challenge flows
-export KOALA_STEPUP_TOKEN="koala_admin_token"
-
-# Postgres DSN for the tamper-evident audit log
-export DATABASE_URL="postgresql://koala:koala_dev_pw@postgres:5432/koala_audit"
-```
-
-### Running the Environment
-Clone the repository and spin up the microservices:
-
-```bash
-git clone https://github.com/your-org/Koala.git
-cd Koala
-docker-compose up --build
-```
-
-This builds and deploys four services — `pep`, `pdp`, `mcp_core`, and `postgres` — onto an isolated bridge network (`zta_internal`). Following Zero Trust, **only the PEP is exposed to the host** (`http://localhost:8000`); `pdp`, `mcp_core`, and `postgres` are reachable only from inside the internal network. All inter-service traffic is identity-bound, signed, and audited.
+1. Ensure you have Docker and Docker Compose installed.
+2. Clone the repository and navigate to the project root:
+   ```bash
+   cd Koala
+   ```
+3. Spin up the cluster:
+   ```bash
+   docker-compose up --build
+   ```
+   *The PEP is exposed on port `8000`. The MCP Core (`8080`) and PDP (`8181`) are isolated to the Docker bridge network and inaccessible from the host.*
 
 ---
 
-## Testing the System
+## Running the Demo
 
-A `mock_agent.py` script is provided to demonstrate the Zero Trust features in action. It executes both a standard "Happy Path" and a simulated "Challenge Flow" that triggers rate-limiting.
+To observe the Zero Trust protections in real-time, execute the mock agent script against the running cluster:
 
-1. Ensure the Docker containers are running.
-2. Install HTTPX (used by the mock agent and the test harness):
-   ```bash
-   pip install httpx
-   ```
-3. Run the mock agent:
-   ```bash
-   python agents/mock_agent.py
-   ```
+```bash
+python agents/mock_agent.py
+```
 
-**What to expect:**
-- The agent successfully initializes and calls `tools/list` and `tools/call`.
-- It intentionally spams the PEP to trigger a drop in its trust score.
-- The PDP responds with a `CHALLENGE` decision.
-- The PEP parks the request and the mock agent immediately sends a `/stepup/verify` request.
-- The parked request is securely released and fully executed.
+**What you will see:**
+1. A baseline `initialize` handshake.
+2. Successful execution of the Public `get_drug_interactions` tool.
+3. A call to the Internal `get_patient_record` tool, where the SSN is visibly scrubbed out of the JSON response by the PEP DLP engine.
+4. A call to the Restricted `prescribe_medication` tool. You will see the agent receive a `CHALLENGE` exception, execute an automated `/stepup/verify` request, and subsequently succeed.
+5. Rate-limiting exhaustion, where rapid subsequent requests dynamically drop the agent's trust score until it reaches a terminal `DENY`.
 
-### Full stress & attack suite
-
-For a deeper, section-by-section walkthrough — rate-limit band stress, step-up brute-force probing, direct-to-core replay / payload-tamper / signature-bypass attacks, and end-to-end hash-chain verification — see [`test/TEST.md`](test/TEST.md). The harness includes:
-
-| Script | Purpose |
-| --- | --- |
-| `test/stress_rate_limit.py`  | Drives one subject through `PERMIT → CHALLENGE → DENY`. |
-| `test/stepup_probe.py`       | Exercises audited 401 / 404 branches of `/stepup/verify`. |
-| `test/forge_attack.py`       | Runs inside the PEP container; hits MCP Core directly with forged / stale / tampered envelopes. |
-| `test/verify_chain.py`       | Recomputes every `record_hash` from Postgres and flags any broken link. |
+*All logs are securely chained in the `koala_audit` Postgres database.*
 
 ---
 
 ## The Team
 
-- **Anirudh** (Lead / Architecture)
-- **Keerthan KK** (Developer)
-- **Aaron Mathews** (Developer)
+Built for the 3rd-year B.Tech Cybersecurity curriculum at **Amrita Vishwa Vidyapeetham**:
 
-*Amrita Vishwa Vidyapeetham, 2026.*
+*   **Anirudh** — Lead / Architecture
+*   **Keerthan KK** — Developer
+*   **Aaron Mathews** — Developer
