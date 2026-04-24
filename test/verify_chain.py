@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from typing import Any
@@ -24,6 +25,26 @@ GENESIS = "0" * 64
 CONTAINER = "zta-postgres"
 DB_USER = "koala"
 DB_NAME = "koala_audit"
+
+# Postgres ``to_jsonb(TIMESTAMPTZ)`` strips trailing zeros from fractional
+# seconds, so a row hashed with ``...:14.490610+00:00`` comes back as
+# ``...:14.49061+00:00``. Python's ``datetime.isoformat()`` always emits
+# exactly 6 fractional digits when microseconds != 0, so the original hash
+# input used 6 digits. Repad on the way out so canonical-JSON bytes line up.
+_TS_FRAC_RE = re.compile(r"\.(\d+)")
+
+
+def _normalize_timestamp(raw: str) -> str:
+    m = _TS_FRAC_RE.search(raw)
+    if not m:
+        # No fractional component — either microseconds were zero (rare,
+        # matches byte-for-byte) or Postgres stripped *all* zeros. Either
+        # way the original hash input also had no fractional component.
+        return raw
+    digits = m.group(1)
+    if len(digits) >= 6:
+        return raw
+    return raw[: m.start() + 1] + digits.ljust(6, "0") + raw[m.end() :]
 
 # Strip the two storage-only columns from the JSON payload — they are not
 # part of what the logger hashed.
@@ -75,7 +96,7 @@ def verify(rows: list[dict[str, Any]]) -> int:
     for i, row in enumerate(rows, start=1):
         event = {
             "id": row["id"],
-            "timestamp": row["timestamp"],
+            "timestamp": _normalize_timestamp(row["timestamp"]),
             "subject_id": row["subject_id"],
             "action": row["action"],
             "decision": row["decision"],
