@@ -1,20 +1,24 @@
-"""PEP (Policy Enforcement Point) — Milestone 5.
-
-Adds tamper-evident audit logging: after a successful tool execution
-returned by the MCP Core, the PEP appends a ``TOOL_CALL`` event (with
-response latency) to the shared hash-chain log. Step-up timeouts and policy
-denials are also logged as ``DENY`` / ``STEPUP`` events for completeness.
+"""PEP (Policy Enforcement Point) — step-up keyed by ``request_id``.
 
 Pipeline:
 
-    1. Build ``SecurityContext`` (request_id, timestamp, method, tool_name,
-       payload_hash = sha256(body), subject_id from X-Koala-Subject).
-    2. POST the context to the PDP ``/authorize``.
-    3. On ``PERMIT``     — sign and forward.
-       On ``CHALLENGE``  — park on an asyncio.Event keyed by subject_id;
-                           ``/stepup/verify`` releases it.
-       On ``DENY``       — JSON-RPC -32001.
-    4. Log the final outcome (and latency) to the audit chain.
+    1. Read ``X-Koala-Request-Id`` header (client-supplied); fall back to a
+       server-generated UUID4. This value is the park key, the
+       ``SecurityContext.request_id``, and the identifier the client posts
+       back to ``/stepup/verify``.
+    2. Compute ``payload_hash = sha256(body)`` and build a
+       :class:`SecurityContext`.
+    3. POST to the PDP ``/authorize``.
+    4. On ``PERMIT``    — sign and forward.
+       On ``CHALLENGE`` — park on an ``asyncio.Event`` keyed by
+                          ``request_id``. ``POST /stepup/verify`` releases
+                          the event; the parked coroutine then signs the
+                          original envelope and proxies to the Core. A
+                          30 s timeout returns JSON-RPC ``-32000``.
+       On ``DENY``      — JSON-RPC ``-32001``.
+    5. Audit every outcome.
+
+Signing, SignatureMiddleware, and audit-logger internals are unchanged.
 """
 
 from __future__ import annotations
@@ -47,23 +51,22 @@ SIGNING_SECRET = os.getenv("KOALA_SIGNING_SECRET", "koala_secret_dev")
 STEPUP_TOKEN = os.getenv("KOALA_STEPUP_TOKEN", "koala_admin_token")
 STEPUP_TIMEOUT_S = float(os.getenv("KOALA_STEPUP_TIMEOUT_S", "30"))
 UPSTREAM_TIMEOUT_S = float(os.getenv("MCP_UPSTREAM_TIMEOUT_S", "45"))
+
 CONTEXT_HEADER = "X-Koala-Context"
 SUBJECT_HEADER = "X-Koala-Subject"
+REQUEST_ID_HEADER = "X-Koala-Request-Id"
 
-# Tool → resource-tier mapping for the Healthcare demo. Drives the PDP's
-# policy band selection (Restricted always requires step-up). Unknown tools
-# default to Public.
+# Declarative catalogue of tools the PDP tier-policy classifies as
+# Restricted. Used for logging + tier mapping; the PDP is what actually
+# forces the CHALLENGE decision.
+RESTRICTED_TOOLS: frozenset[str] = frozenset({"prescribe_medication"})
+
 TOOL_RESOURCE_TIER: dict[str, str] = {
     "get_drug_interactions": "Public",
     "get_patient_record": "Internal",
     "prescribe_medication": "Restricted",
 }
 
-# Egress DLP: naive SSN redactor. Matches the US "XXX-XX-XXXX" format we use
-# in the mock patient dataset. Runs over the raw JSON bytes so both
-# ``structuredContent`` and the stringified ``content[0].text`` are scrubbed
-# in one pass. Production DLP would need format-preserving tokenization and
-# locale-aware context — this is demo-grade.
 _SSN_PATTERN = re.compile(rb"\b\d{3}-\d{2}-\d{4}\b")
 _SSN_REPLACEMENT = b"[REDACTED_SSN]"
 
@@ -80,7 +83,14 @@ _HOP_BY_HOP = {
     "content-length",
 }
 
+# Parked-challenge store. Keyed by request_id so concurrent challenges for
+# the same subject do not collide on a single slot.
 PARKED_REQUESTS: dict[str, asyncio.Event] = {}
+
+# Side-car metadata kept in lock-step with PARKED_REQUESTS on every mutation
+# so the STEPUP audit row can record the original subject/tool even though
+# the endpoint is keyed only by request_id.
+_PARKED_META: dict[str, dict[str, Any]] = {}
 
 logger = logging.getLogger("pep")
 logging.basicConfig(level=logging.INFO)
@@ -95,8 +105,6 @@ async def lifespan(_app: FastAPI):
     _client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_S)
     _audit = logger_from_env(service="pep")
     await _audit.connect()
-    # PDP also runs init_schema on startup; calling it here is idempotent
-    # and means the PEP can write even if the PDP is slower to come up.
     await _audit.init_schema()
     logger.info("PEP up; forwarding to %s via PDP %s", MCP_CORE_URL, PDP_URL)
     try:
@@ -106,12 +114,15 @@ async def lifespan(_app: FastAPI):
         await _audit.close()
 
 
-app = FastAPI(title="ZTA-MCP PEP", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="ZTA-MCP PEP", version="0.7.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "pep"}
+
+
+# ---- helpers -----------------------------------------------------------------
 
 
 def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -129,7 +140,10 @@ def _parse_rpc(body: bytes) -> dict[str, Any] | None:
 
 
 def _build_context(
-    rpc: dict[str, Any] | None, payload_hash: str, subject_id: str
+    rpc: dict[str, Any] | None,
+    payload_hash: str,
+    subject_id: str,
+    request_id: str,
 ) -> SecurityContext:
     method = (rpc or {}).get("method", "") or "<no-method>"
     tool_name: str | None = None
@@ -141,7 +155,7 @@ def _build_context(
         TOOL_RESOURCE_TIER.get(tool_name, "Public") if tool_name else "Public"
     )
     return SecurityContext(
-        request_id=str(uuid.uuid4()),
+        request_id=request_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
         method=method,
         tool_name=tool_name,
@@ -149,13 +163,6 @@ def _build_context(
         payload_hash=payload_hash,
         subject_id=subject_id,
     )
-
-
-def _scrub_egress(body: bytes) -> bytes:
-    """Run the SSN DLP pattern across raw response bytes."""
-    if not body:
-        return body
-    return _SSN_PATTERN.sub(_SSN_REPLACEMENT, body)
 
 
 def _encode_context_header(context: SecurityContext) -> str:
@@ -174,10 +181,15 @@ def _rpc_error(status: int, id_: Any, code: int, message: str) -> JSONResponse:
     )
 
 
+def _scrub_egress(body: bytes) -> bytes:
+    if not body:
+        return body
+    return _SSN_PATTERN.sub(_SSN_REPLACEMENT, body)
+
+
 async def _forward(
     request: Request, body: bytes, context: SecurityContext, rpc_id: Any
 ) -> tuple[Response, float, int]:
-    """Sign, forward, and return the upstream response + latency_ms + status."""
     assert _client is not None
     context.signature = sign_context(context.to_signable(), SIGNING_SECRET)
 
@@ -203,11 +215,7 @@ async def _forward(
         )
     latency_ms = (time.perf_counter() - start) * 1000
 
-    # Egress DLP: scrub sensitive data before it crosses the trust boundary.
-    # Content-Length is dropped by _filter_headers above (hop-by-hop) and
-    # Starlette re-emits it from the body we pass, so size changes are safe.
     scrubbed = _scrub_egress(upstream.content)
-
     response = Response(
         content=scrubbed,
         status_code=upstream.status_code,
@@ -217,20 +225,43 @@ async def _forward(
     return response, latency_ms, upstream.status_code
 
 
-async def _park_for_stepup(subject_id: str, request_id: str) -> bool:
+async def _park_for_stepup(
+    request_id: str, subject_id: str, tool_name: str | None
+) -> bool:
+    """Park until ``/stepup/verify`` arrives for ``request_id``.
+
+    ``try/finally`` guarantees both stores drop this entry on any exit —
+    success, timeout, or coroutine cancellation — so no memory leak.
+    """
     event = asyncio.Event()
-    PARKED_REQUESTS[subject_id] = event
+    PARKED_REQUESTS[request_id] = event
+    _PARKED_META[request_id] = {
+        "subject_id": subject_id,
+        "tool_name": tool_name,
+        "approved": False,
+    }
     logger.info(
-        "parking request_id=%s subject=%s for step-up", request_id, subject_id
+        "parking request_id=%s subject=%s tool=%s",
+        request_id,
+        subject_id,
+        tool_name,
     )
     try:
         await asyncio.wait_for(event.wait(), timeout=STEPUP_TIMEOUT_S)
+        if not _PARKED_META.get(request_id, {}).get("approved"):
+            raise TimeoutError("Step-up not approved")
         return True
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, TimeoutError):
         return False
     finally:
-        if PARKED_REQUESTS.get(subject_id) is event:
-            PARKED_REQUESTS.pop(subject_id, None)
+        # Only evict our own slot — a re-park with the same request_id
+        # would have installed a fresh Event we must not clobber.
+        if PARKED_REQUESTS.get(request_id) is event:
+            PARKED_REQUESTS.pop(request_id, None)
+            _PARKED_META.pop(request_id, None)
+
+
+# ---- audit wrappers ----------------------------------------------------------
 
 
 async def _audit_tool_call(
@@ -261,9 +292,6 @@ async def _audit_tool_call(
             }
         )
     except Exception:
-        # Audit failure must not poison the user response; it is logged loudly
-        # so operators can investigate. In a regulated deployment the service
-        # should fail-closed here, but M5 keeps the request path available.
         logger.exception("audit append failed for request_id=%s", context.request_id)
 
 
@@ -290,6 +318,38 @@ async def _audit_denial(
         logger.exception("audit append failed for request_id=%s", context.request_id)
 
 
+async def _audit_stepup(
+    *,
+    request_id: str,
+    subject_id: str | None,
+    tool_name: str | None,
+    decision: str,
+    reason: str,
+    http_status: int,
+) -> None:
+    assert _audit is not None
+    try:
+        await _audit.append_log(
+            {
+                "subject_id": subject_id or f"unknown:rid={request_id}",
+                "action": "STEPUP",
+                "decision": decision,
+                "resource_tier": None,
+                "details": {
+                    "request_id": request_id,
+                    "tool_name": tool_name,
+                    "reason": reason,
+                    "http_status": http_status,
+                },
+            }
+        )
+    except Exception:
+        logger.exception("audit append failed for stepup rid=%s", request_id)
+
+
+# ---- router ------------------------------------------------------------------
+
+
 @app.post("/mcp")
 @app.get("/mcp")
 @app.delete("/mcp")
@@ -300,8 +360,21 @@ async def mcp_proxy(request: Request) -> Response:
     rpc_id = rpc.get("id") if rpc else None
 
     subject_id = request.headers.get(SUBJECT_HEADER) or "anonymous"
+    # Prefer the client-supplied request_id so the agent can reference the
+    # same value from the /stepup/verify side-channel; fall back to a
+    # server UUID when the header is absent.
+    client_rid = request.headers.get(REQUEST_ID_HEADER)
+    request_id = client_rid or str(uuid.uuid4())
     payload_hash = hashlib.sha256(body).hexdigest()
-    context = _build_context(rpc, payload_hash, subject_id)
+    context = _build_context(rpc, payload_hash, subject_id, request_id)
+
+    if context.tool_name in RESTRICTED_TOOLS:
+        logger.info(
+            "restricted tool attempt request_id=%s subject=%s tool=%s",
+            request_id,
+            subject_id,
+            context.tool_name,
+        )
 
     try:
         decision_resp = await _client.post(
@@ -321,9 +394,7 @@ async def mcp_proxy(request: Request) -> Response:
 
     if decision == "DENY":
         reason = decision_body.get("reason") or "denied"
-        logger.info(
-            "PDP denied request_id=%s reason=%s", context.request_id, reason
-        )
+        logger.info("PDP denied request_id=%s reason=%s", request_id, reason)
         await _audit_denial(
             subject_id=subject_id,
             context=context,
@@ -334,11 +405,15 @@ async def mcp_proxy(request: Request) -> Response:
 
     stepped_up = False
     if decision == "CHALLENGE":
-        released = await _park_for_stepup(subject_id, context.request_id)
+        released = await _park_for_stepup(
+            request_id=request_id,
+            subject_id=subject_id,
+            tool_name=context.tool_name,
+        )
         if not released:
             logger.info(
                 "step-up timeout request_id=%s subject=%s",
-                context.request_id,
+                request_id,
                 subject_id,
             )
             await _audit_denial(
@@ -352,7 +427,7 @@ async def mcp_proxy(request: Request) -> Response:
             )
         logger.info(
             "step-up verified request_id=%s subject=%s — forwarding",
-            context.request_id,
+            request_id,
             subject_id,
         )
         stepped_up = True
@@ -365,9 +440,6 @@ async def mcp_proxy(request: Request) -> Response:
         request, body, context, rpc_id
     )
 
-    # Audit only *successful* tool execution in the successful-path bucket;
-    # upstream 2xx / 3xx counts as success from the PEP's perspective. A 4xx
-    # or 5xx from the core is logged as a denial-ish event instead.
     if 200 <= upstream_status < 400:
         await _audit_tool_call(
             subject_id=subject_id,
@@ -387,78 +459,71 @@ async def mcp_proxy(request: Request) -> Response:
     return response
 
 
-# ---- Step-up endpoint --------------------------------------------------------
+# ---- step-up endpoint --------------------------------------------------------
 
 
 class StepupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    subject_id: str
+    request_id: str
     secondary_token: str
-
-
-async def _audit_stepup(
-    *,
-    subject_id: str,
-    decision: str,
-    reason: str,
-    http_status: int,
-) -> None:
-    """Record a step-up outcome on the tamper-evident audit chain.
-
-    Every branch of :func:`stepup_verify` must funnel through here so that
-    probing attacks (bad tokens, no-parked-challenge reconnaissance) are
-    immutably recorded alongside legitimate successes.
-    """
-    assert _audit is not None
-    try:
-        await _audit.append_log(
-            {
-                "subject_id": subject_id,
-                "action": "STEPUP",
-                "decision": decision,
-                "resource_tier": None,
-                "details": {
-                    "reason": reason,
-                    "http_status": http_status,
-                },
-            }
-        )
-    except Exception:
-        logger.exception("audit append failed for stepup subject=%s", subject_id)
 
 
 @app.post("/stepup/verify")
 async def stepup_verify(payload: StepupRequest) -> dict[str, str]:
-    if payload.secondary_token != STEPUP_TOKEN:
-        logger.warning("stepup: bad token for subject=%s", payload.subject_id)
+    event = PARKED_REQUESTS.get(payload.request_id)
+    if event is None:
+        logger.warning(
+            "stepup: no parked challenge for request_id=%s", payload.request_id
+        )
         await _audit_stepup(
-            subject_id=payload.subject_id,
+            request_id=payload.request_id,
+            subject_id=None,
+            tool_name=None,
+            decision="DENY",
+            reason="No active challenge",
+            http_status=404,
+        )
+        raise HTTPException(
+            status_code=404, detail="no pending challenge for request_id"
+        )
+
+    meta = _PARKED_META.get(payload.request_id, {})
+    subject_id = meta.get("subject_id")
+    tool_name = meta.get("tool_name")
+
+    if payload.secondary_token != STEPUP_TOKEN:
+        logger.warning(
+            "stepup: bad token for request_id=%s subject=%s",
+            payload.request_id,
+            subject_id,
+        )
+        await _audit_stepup(
+            request_id=payload.request_id,
+            subject_id=subject_id,
+            tool_name=tool_name,
             decision="DENY",
             reason="Invalid token",
             http_status=401,
         )
         raise HTTPException(status_code=401, detail="invalid secondary token")
 
-    event = PARKED_REQUESTS.pop(payload.subject_id, None)
-    if event is None:
-        logger.warning(
-            "stepup: no parked challenge for subject=%s", payload.subject_id
-        )
-        await _audit_stepup(
-            subject_id=payload.subject_id,
-            decision="DENY",
-            reason="No active challenge",
-            http_status=404,
-        )
-        raise HTTPException(
-            status_code=404, detail="no pending challenge for subject"
-        )
-
+    # Mark approval on the meta BEFORE releasing the event so the parked
+    # coroutine sees ``approved=True`` as soon as ``event.wait()`` returns.
+    # Deletion of both stores happens exclusively in ``_park_for_stepup``'s
+    # finally block — a single source of deletion prevents races.
+    _PARKED_META.setdefault(payload.request_id, {})["approved"] = True
     event.set()
-    logger.info("stepup: released subject=%s", payload.subject_id)
+
+    logger.info(
+        "stepup: released request_id=%s subject=%s",
+        payload.request_id,
+        subject_id,
+    )
     await _audit_stepup(
-        subject_id=payload.subject_id,
+        request_id=payload.request_id,
+        subject_id=subject_id,
+        tool_name=tool_name,
         decision="PERMIT",
         reason="Step-up verified",
         http_status=200,

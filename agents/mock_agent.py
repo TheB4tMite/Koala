@@ -8,9 +8,11 @@ at ``http://localhost:8000``:
     Scenario B  Internal tool: get_patient_record
                 PDP => PERMIT. PEP egress DLP scrubs the SSN in-flight.
     Scenario C  Restricted tool: prescribe_medication
-                PDP => CHALLENGE. Background task provides the step-up
-                token and the parked request resumes.
-    Scenario D  Rogue agent: 10× spam of get_drug_interactions
+                PDP => CHALLENGE. A client-generated request_id is sent
+                in ``X-Koala-Request-Id``; a background task POSTs the
+                same request_id to ``/stepup/verify`` after ~2s; the
+                parked coroutine resumes.
+    Scenario D  Rogue agent: 10x spam of get_drug_interactions
                 Trust score collapses; final requests are denied.
 """
 
@@ -19,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import uuid
 from typing import Any
 
 import httpx
@@ -63,7 +66,9 @@ def pretty(label: str, body: Any) -> None:
 # ---- Transport ---------------------------------------------------------------
 
 
-def _headers(sid: str | None = None) -> dict[str, str]:
+def _headers(
+    sid: str | None = None, request_id: str | None = None
+) -> dict[str, str]:
     h = {
         "Accept": ACCEPT,
         "Content-Type": "application/json",
@@ -71,6 +76,8 @@ def _headers(sid: str | None = None) -> dict[str, str]:
     }
     if sid:
         h["Mcp-Session-Id"] = sid
+    if request_id:
+        h["X-Koala-Request-Id"] = request_id
     return h
 
 
@@ -97,10 +104,14 @@ async def _rpc(
     sid: str | None,
     *,
     timeout: float = 30.0,
+    request_id: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, httpx.Response | None]:
     try:
         r = await client.post(
-            PEP_MCP, json=payload, headers=_headers(sid), timeout=timeout
+            PEP_MCP,
+            json=payload,
+            headers=_headers(sid, request_id),
+            timeout=timeout,
         )
     except (httpx.ReadTimeout, httpx.ConnectTimeout, asyncio.TimeoutError):
         return None, sid, None
@@ -139,6 +150,7 @@ async def _call_tool(
     rpc_id: int,
     *,
     timeout: float = 30.0,
+    request_id: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, httpx.Response | None]:
     return await _rpc(
         client,
@@ -150,6 +162,21 @@ async def _call_tool(
         },
         sid,
         timeout=timeout,
+        request_id=request_id,
+    )
+
+
+async def approve_later(
+    client: httpx.AsyncClient, request_id: str, *, delay: float = 2.0
+) -> httpx.Response:
+    """Background helper: wait then POST the secondary token."""
+    await asyncio.sleep(delay)
+    return await client.post(
+        PEP_STEPUP,
+        json={
+            "request_id": request_id,
+            "secondary_token": STEPUP_TOKEN,
+        },
     )
 
 
@@ -201,34 +228,31 @@ async def scenario_c(
     banner("C - Restricted tier: prescribe_medication (step-up)", "SCENARIO")
     note("Agent attempts a privileged write (prescribing a new medication).")
     note("Restricted tier policy at the PDP forces CHALLENGE regardless of")
-    note("trust score. The PEP parks the request; a back-channel provides")
-    note("the step-up token ~1s later; the parked coroutine resumes.")
+    note("trust score. The PEP parks the request; a back-channel posts the")
+    note("step-up token ~2s later using the SAME request_id; parked coroutine")
+    note("resumes and signs + forwards to the MCP Core.")
 
-    call_task = asyncio.create_task(
-        _call_tool(
-            client,
-            sid,
-            "prescribe_medication",
-            {"patient_id": "P001", "medication": "amoxicillin 500mg"},
-            12,
-            timeout=45.0,
-        )
+    request_id = str(uuid.uuid4())
+    note(f"Pre-generated request_id = {request_id}")
+
+    # Kick the approval off first so the 2s sleep runs concurrently with
+    # the main call reaching the PEP and entering the parked state.
+    approval_task = asyncio.create_task(approve_later(client, request_id))
+
+    body, sid, resp = await _call_tool(
+        client,
+        sid,
+        "prescribe_medication",
+        {"patient_id": "P001", "medication": "amoxicillin 500mg"},
+        12,
+        timeout=45.0,
+        request_id=request_id,
     )
 
-    await asyncio.sleep(1.2)
-    if call_task.done():
-        note("Warning: request completed without parking. Check PDP policy band.")
-    else:
-        note("Request is parked at the PEP. Sending /stepup/verify ...")
-        stepup_resp = await client.post(
-            PEP_STEPUP,
-            json={"subject_id": SUBJECT, "secondary_token": STEPUP_TOKEN},
-        )
-        note(
-            f"Step-up response: HTTP {stepup_resp.status_code} body={stepup_resp.text}"
-        )
-
-    body, sid, resp = await call_task
+    stepup_resp = await approval_task
+    note(
+        f"Step-up response: HTTP {stepup_resp.status_code} body={stepup_resp.text}"
+    )
     print(f"  HTTP status: {resp.status_code if resp else 'n/a'}")
     pretty("Post-step-up response", body)
     return sid
