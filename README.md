@@ -111,17 +111,30 @@ This builds and deploys four services — `pep`, `pdp`, `mcp_core`, and `postgre
 
 ## Testing the System
 
-A `mock_agent.py` script is provided to demonstrate the Zero Trust features in action. It executes both a standard "Happy Path" and a simulated "Challenge Flow" that triggers rate-limiting.
+### 1. Mock Agent (Baseline)
+A `mock_agent.py` script is provided to demonstrate the Zero Trust features in action.
+```bash
+python agents/mock_agent.py
+```
 
-1. Ensure the Docker containers are running.
-2. Install HTTPX (used by the mock agent and the test harness):
-   ```bash
-   pip install httpx
-   ```
-3. Run the mock agent:
-   ```bash
-   python agents/mock_agent.py
-   ```
+### 2. LLM Agent (Gemma-driven)
+The primary agent is `llm_agent.py`, which uses a local LLM to drive MCP tools.
+
+**Prerequisites:**
+- [Ollama](https://ollama.com/) installed and running.
+- Pull the model: `ollama pull gemma3:4b`
+- Install requirements: `pip install -r agents/requirements.txt`
+
+**Run:**
+```bash
+# Interactive REPL
+python agents/llm_agent.py
+
+# Single prompt
+python agents/llm_agent.py --prompt "What is the weather in Bengaluru?"
+```
+
+See [`agents/LLM_AGENT.md`](agents/LLM_AGENT.md) for full documentation on supported backends and prompt formats.
 
 **What to expect:**
 - The agent successfully initializes and calls `tools/list` and `tools/call`.

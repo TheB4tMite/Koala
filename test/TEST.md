@@ -56,12 +56,17 @@ Expect: `{"status":"ok","service":"pdp"}` and `{"status":"ok","service":"mcp_cor
 
 ## 2. Happy path (Milestones 1–2)
 
+**A. Mock Agent:**
 ```bash
 python agents/mock_agent.py
 ```
 
-Expect a clean run ending with a `get_weather` result for `ChallengeCity`
-after a `/stepup/verify` round-trip. This exercises:
+**B. LLM Agent:**
+```bash
+python agents/llm_agent.py --prompt "What is the weather in Bengaluru?"
+```
+
+Expect a clean run ending with a `get_weather` result. Both agents exercise:
 
 - JSON-RPC through the PEP → PDP → Core
 - HMAC signing of the `SecurityContext` at the PEP
