@@ -123,7 +123,7 @@ def main() -> int:
             "jsonrpc": "2.0",
             "id": 99,
             "method": "tools/call",
-            "params": {"name": "read_dummy_file", "arguments": {}},
+            "params": {"name": "get_drug_interactions", "arguments": {}},
         }
     ).encode()
     h = {**base, "X-Koala-Context": _signed_header(body)}  # binds to original

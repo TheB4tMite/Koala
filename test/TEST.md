@@ -60,7 +60,7 @@ Expect: `{"status":"ok","service":"pdp"}` and `{"status":"ok","service":"mcp_cor
 python agents/mock_agent.py
 ```
 
-Expect a clean run ending with a `get_weather` result for `ChallengeCity`
+Expect a clean run ending with a `prescribe_medication` result
 after a `/stepup/verify` round-trip. This exercises:
 
 - JSON-RPC through the PEP → PDP → Core
@@ -164,7 +164,7 @@ r = httpx.post(
     json={
         "jsonrpc": "2.0", "id": 9999,
         "method": "tools/call",
-        "params": {"name": "get_weather", "arguments": {"location": "Void"}}
+        "params": {"name": "get_drug_interactions", "arguments": {"drug_a": "aspirin", "drug_b": "warfarin"}}
     },
     timeout=60,
 )
@@ -255,6 +255,29 @@ docker-compose logs --tail=50 pdp | grep "gc: evicted"
 
 Expect at least one log line like `trust-scorer gc: evicted N idle subjects`
 where `N ≥ 20`.
+
+---
+
+## 9. LLM Agent Demo (Healthcare Branch)
+
+Verifies the ReAct-style LLM agent integration with DLP and request-id keyed step-up.
+
+```bash
+python agents/llm_agent.py --scenario all
+```
+
+**Expected results for each scenario:**
+
+1.  **Public Tier (Drug Interactions):** One-shot `PERMIT`.
+2.  **Internal Tier (Patient Records):** `PERMIT`. The agent should log `[!] PEP DLP scrubbed SSN` as it detects the redaction in the response.
+3.  **Restricted Tier (Prescribing):** Immediate `CHALLENGE`. The agent logs the race between the parked call and the background `/stepup/verify` (using `request_id`). After success, it retries and gets a `PERMIT`.
+4.  **Rogue Agent Stress:** Rapid calls until the trust score collapses. PDP returns `DENY`.
+
+After the run, verify the audit chain contains the `TOOL_CALL`, `STEPUP`, and `AUTHORIZE` events with the unique `request_id`s:
+
+```bash
+python test/verify_chain.py
+```
 
 ---
 

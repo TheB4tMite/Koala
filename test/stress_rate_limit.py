@@ -70,8 +70,8 @@ async def _call(
         "id": rpc_id,
         "method": "tools/call",
         "params": {
-            "name": "get_weather",
-            "arguments": {"location": f"StressCity-{rpc_id}"},
+            "name": "get_drug_interactions",
+            "arguments": {"drug_a": "aspirin", "drug_b": f"Stress-{rpc_id}"},
         },
     }
     try:
