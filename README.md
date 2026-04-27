@@ -18,7 +18,7 @@ Project Koala introduces a Policy Enforcement Point (PEP) and a Policy Decision 
 
 ```mermaid
 sequenceDiagram
-    participant Agent as AI Agent (Client)
+    participant Agent as AI Agent (LLM or Mock)
     participant PEP as Policy Enforcement Point
     participant PDP as Policy Decision Point
     participant DB as Postgres (Audit Hash-Chain)
@@ -64,63 +64,76 @@ sequenceDiagram
 
 ## The Healthcare Demo Scenario
 
-To demonstrate the architecture, the MCP Core exposes a mock clinical-decision assistant with three distinct tools mapped to progressive resource tiers:
+The MCP Core exposes a clinical-decision assistant with three distinct tools mapped to progressive resource tiers:
 
-1. `get_drug_interactions` **(Public Tier)**
-   * **Action:** Queries a mock formulary for drug interactions.
-   * **Security:** Allowed by default, assuming the agent's continuous trust score has not dipped due to rate-limit violations.
-2. `get_patient_record` **(Internal Tier)**
-   * **Action:** Retrieves patient demographics and medical history.
-   * **Security:** Contains highly sensitive PHI (SSNs). On the return path, the PEP's **Egress Data Loss Prevention (DLP)** engine automatically detects and replaces the SSN with `[REDACTED_SSN]` to prevent the agent from absorbing or leaking the data.
-3. `prescribe_medication` **(Restricted Tier)**
-   * **Action:** A state-modifying write action to a patient's chart.
-   * **Security:** Triggers an immediate **Step-Up Authentication** challenge. The PEP parks the in-flight request and forces the agent to supply a secondary verification token before the cryptographic seal is generated.
+1. `get_drug_interactions` **(Public Tier)**: Queries a mock formulary. Security: Allowed by default.
+2. `get_patient_record` **(Internal Tier)**: Retrieves patient history. Security: Triggers **Egress DLP**. PEP automatically replaces SSNs with `[REDACTED_SSN]` to prevent data exfiltration.
+3. `prescribe_medication` **(Restricted Tier)**: State-modifying action. Security: Triggers immediate **Step-Up Authentication**. The agent must provide a secondary token before the request is signed and forwarded.
 
 ---
 
 ## Core Zero Trust Features
 
-*   **Cryptographic Context Sealing:** The PEP locks the request metadata and a SHA-256 hash of the payload inside an HMAC-SHA256 envelope. The MCP Core strictly fails closed, completely rejecting traffic lacking a valid signature, mismatched payload hash, or stale timestamp (defending against Replay Attacks and network bypass).
-*   **Continuous Trust Evaluation (CARTA):** The PDP features a sliding-window rate-limiter that acts as a continuous trust scorer. A subject's trust score dynamically drops upon anomalous request volumes, downgrading their access from `PERMIT` to `CHALLENGE` or `DENY`.
-*   **Asynchronous Step-Up Authentication:** When the PDP returns `CHALLENGE`, the PEP safely suspends the asyncio coroutine without dropping the connection or leaking memory. The request only resumes when an out-of-band `/stepup/verify` call provides a valid token.
-*   **Tamper-Evident Audit Logging:** Every terminal security decision is recorded in PostgreSQL. Each row is bound to the previous row via `record_hash = sha256(prev_hash || payload)`. Postgres advisory locks serialize concurrent writes across instances, ensuring the chain is mathematically unbroken and immune to silent database tampering.
-*   **Egress Data Loss Prevention (DLP):** Outbound payload scrubbing prevents the MCP Core from accidentally leaking protected data to the untrusted agent network.
+*   **Cryptographic Context Sealing:** PEP locks request metadata and SHA-256 payload hashes inside an HMAC-SHA256 envelope. MCP Core fails closed if signatures are missing or stale.
+*   **Continuous Trust Evaluation (CARTA):** PDP uses a sliding-window rate-limiter as a trust scorer. Anomalous request volumes drop the subject's score, triggering `CHALLENGE` or `DENY`.
+*   **Asynchronous Step-Up Authentication:** PEP suspends in-flight requests (Asyncio parking) when challenged, resuming only after a valid `/stepup/verify` call.
+*   **Tamper-Evident Audit Logging:** Chained PostgreSQL logs (`record_hash = sha256(prev_hash || payload)`) ensure mathematical audit integrity.
+*   **Egress Data Loss Prevention (DLP):** Real-time outbound scrubbing of sensitive patterns (SSNs) at the PEP layer.
+
+---
+
+## New: Local LLM Agent (ReAct)
+
+This branch introduces a sophisticated **Local LLM Agent** (`agents/llm_agent.py`) that acts as the "untrusted" client.
+- **Provider-Agnostic**: Supports **Ollama** (default: `gemma3:4b`) or OpenAI.
+- **ReAct Implementation**: Dynamically discovers MCP tools and reason-act loops to solve medical prompts.
+- **ZTA Awareness**: The LLM is system-prompted to handle redacted PHI and is "aware" of the PEP's security boundaries.
+- **Auto-Step-Up**: The agent script handles back-channel token verification to transparently satisfy security challenges.
 
 ---
 
 ## Quick Start / Setup
 
-Project Koala is completely containerized. The `docker-compose.yml` orchestrates the PostgreSQL database, the PDP, the PEP, and the MCP Core on an isolated internal network.
+Project Koala is completely containerized.
 
-1. Ensure you have Docker and Docker Compose installed.
-2. Clone the repository and navigate to the project root:
-   ```bash
-   cd Koala
-   ```
-3. Spin up the cluster:
-   ```bash
-   docker-compose up --build
-   ```
-   *The PEP is exposed on port `8000`. The MCP Core (`8080`) and PDP (`8181`) are isolated to the Docker bridge network and inaccessible from the host.*
+1.  **Ensure Prerequisites:**
+    - Docker & Docker Compose.
+    - **Ollama** (if using local LLM): `ollama pull gemma3:4b`
+2.  **Spin up the Infrastructure:**
+    ```bash
+    docker-compose up --build -d
+    ```
+    *The PEP (8000) is exposed; PDP (8181) and Core (8080) are isolated.*
 
 ---
 
 ## Running the Demo
 
-To observe the Zero Trust protections in real-time, execute the mock agent script against the running cluster:
+### 1. Interactive LLM Agent (Recommended)
+Launch the ReAct agent and chat with the clinical assistant:
+```bash
+python agents/llm_agent.py
+```
+**Try these prompts:**
+- *"Is there an interaction between aspirin and warfarin?"* (Public Tool)
+- *"Show me the medical record for patient P001."* (Internal Tool + **DLP Scrubbing**)
+- *"Prescribe 500mg Amoxicillin for P001."* (Restricted Tool + **Step-Up Challenge**)
 
+### 2. Canned Scenarios
+Execute automated demo flows:
+```bash
+python agents/llm_agent.py --scenario a|b|c|d|all
+```
+- `a`: Public access.
+- `b`: DLP verification.
+- `c`: Step-up authentication flow.
+- `d`: Stress test (triggers Rate-Limit DENY).
+
+### 3. Lightweight Mock Agent
+For quick protocol verification without an LLM:
 ```bash
 python agents/mock_agent.py
 ```
-
-**What you will see:**
-1. A baseline `initialize` handshake.
-2. Successful execution of the Public `get_drug_interactions` tool.
-3. A call to the Internal `get_patient_record` tool, where the SSN is visibly scrubbed out of the JSON response by the PEP DLP engine.
-4. A call to the Restricted `prescribe_medication` tool. You will see the agent receive a `CHALLENGE` exception, execute an automated `/stepup/verify` request, and subsequently succeed.
-5. Rate-limiting exhaustion, where rapid subsequent requests dynamically drop the agent's trust score until it reaches a terminal `DENY`.
-
-*All logs are securely chained in the `koala_audit` Postgres database.*
 
 ---
 
